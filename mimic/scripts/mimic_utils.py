@@ -432,13 +432,16 @@ def get_reconciled_rotation_value(robot, axis, rotation_axis, current_frame):
     # Find the closest keyframe on the robot's IK attribute
     closest_ik_key, count_direction = get_closest_ik_keyframe(robot,
                                                               current_frame)
-    # If there are no IK attribute keyframes on the current robot,
-    # exit the function.
-    if not type(closest_ik_key) == float:
-        return keyed_val, flip
 
     attr_path = '{0}|{1}robot_GRP|{1}FK_CTRLS|{1}a{2}FK_CTRL.rotate{3}' \
                 .format(robot, robot.namespace(), axis, rotation_axis)
+
+    # If there are no IK attribute keyframes on the current robot,
+    # return the DG produced value and exit the function.
+    if not type(closest_ik_key) == float:
+        keyed_val = pm.getAttr(target_ctrl_path + '.axis{}'.format(axis),
+                               time=current_frame)
+        return keyed_val, flip
 
     # If the current frame has an ik attribute keyframe,
     # assign that value as the keyed value.
@@ -645,6 +648,12 @@ def find_ik_solutions(robot):
     # manufacturer and the zero pose of the IK solver (see documentation).
     a2_offset = pm.getAttr(target_ctrl_path + '.axis2Offset')
 
+    # Most rigs don't have an A5 offset attribute. Had to add for Yaskawas
+    if pm.objExists(target_ctrl_path + '.axis5Offset'):
+        a5_offset = pm.getAttr(target_ctrl_path + '.axis5Offset')
+    else:
+        a5_offset = 0
+
     # Each robot manufacturer defines positive and negative axis rotation
     # differently in relation our IK solver implementation.
     # This is defined on each robot rig by the axis* attribute
@@ -810,6 +819,7 @@ def find_ik_solutions(robot):
 
     # Account for robot manufacturer's Axis 2 offset from solver
     theta2_sol[:] = [x - a2_offset for x in theta2_sol]
+    theta5_sol[:] = [x - a5_offset for x in theta5_sol]
 
     # Account for robot manufacturer's inverted rotation directions
     flip = 1
