@@ -38,9 +38,8 @@ def analyze_program(*args):
     Check program parameters, raise exception on failure
     :return:
     """
-    # Do this first upon button click!
+    # Initialize Mimic UI State
     _clear_output_window()
-    _initialize_export_progress_bar()
 
     # Check program, commands, raise exception on failure
     program_settings = _get_settings()
@@ -50,27 +49,30 @@ def analyze_program(*args):
     start_frame = animation_settings['Start Frame']
     pm.currentTime(start_frame)
 
-    # Force evaluation of reconcile rotation to ensure proper export
-    mimic_utils.reconcile_rotation(force_eval=True)
-    
-    command_dicts = _get_command_dicts(*program_settings)
-    limit_data = mimic_utils.get_all_limits(robot_name)
-
+    # Create progress window and analyze program
+    _initialize_export_progress_window('Analyzing')
+    try:
+        command_dicts = _get_command_dicts(*program_settings)
+    except mimic_utils.MimicError:
+        pm.headsUpMessage('Program analysis canceled.')
+        return
 
     violation_exception, violation_warning = _check_command_dicts(command_dicts, *program_settings)
-    _initialize_export_progress_bar(is_on=False)
+    _destroy_progress_window()
 
     # If PyQtGraph imports correctly, we can run the analysis graphing utility
     # Likeliest cause of import failure is no or improper installation of numPy
     # See Mimic installation instructions for more details on installing numPy
     try:
         import pyqtgraph as pg
-        analysis.run(robot_name, command_dicts, limit_data)
     except ImportError:
         pm.warning('MIMIC: Analysis module did not load successfully; ' \
                    'analysis graphing feature disabled. ' \
                    'Check that you have numPy installed properly; ' \
                    'see Mimic installation instructions for more details')
+
+    limit_data = mimic_utils.get_all_limits(robot_name)
+    analysis.run(robot_name, command_dicts, limit_data)
 
     # If we're sampling keyframes only, we assume it's for a post-processor
     # that's not time-dependent, and, therefore, we shouldn't raise exceptions
@@ -90,7 +92,6 @@ def save_program(*args):
     """
     # Do this first upon button click!
     _clear_output_window()
-    _initialize_export_progress_bar()
 
     # Check program, commands, raise exception on failure
     program_settings = _get_settings()
@@ -100,10 +101,13 @@ def save_program(*args):
 
     pm.currentTime(start_frame)
 
-    # Force evaluation of reconcile rotation to ensure proper export
-    mimic_utils.reconcile_rotation(force_eval=True)
-
-    command_dicts = _get_command_dicts(*program_settings)
+    # Create progress window and save program
+    _initialize_export_progress_window('Saving')
+    try:
+        command_dicts = _get_command_dicts(*program_settings)
+    except mimic_utils.MimicError:
+        pm.headsUpMessage('Program save canceled.')
+        return
 
     violation_exception, violation_warning = _check_command_dicts(command_dicts, *program_settings)
 
@@ -115,7 +119,7 @@ def save_program(*args):
 
     if not using_keyframes_only:
         if violation_exception:
-            _initialize_export_progress_bar(is_on=False)
+            _destroy_progress_window()
 
             pm.scrollField(OUTPUT_WINDOW_NAME,
                    insertText='\n\nNO PROGRAM EXPORTED!',
@@ -127,6 +131,15 @@ def save_program(*args):
             raise mimic_utils.MimicError('Limit violations found. ' \
                                          'No Program Exported. ' \
                                          'See Mimic output window for details.')
+
+    # If axis 2 and 3 are coupled (as they are with FANUC, for example),
+    # Modify A3 accordingly before post-processing
+    # Note: we need to do this after limit checking to get accurate derivatives
+    robot_name = program_settings[0]
+    robot = pm.ls(robot_name)[0]
+
+    if mimic_utils.axes_coupled(robot):
+        command_dicts = _couple_axes(command_dicts)
 
     # Continue to save program:
     _process_program(command_dicts, *program_settings)
@@ -142,7 +155,7 @@ def save_program(*args):
         pm.headsUpMessage('Program exported successfuly; ' \
                           'See Mimic output window for details')
 
-    _initialize_export_progress_bar(is_on=False)
+    _destroy_progress_window()
 
 
 def _process_program(command_dicts, robot, animation_settings, postproc_settings, user_options):
@@ -258,16 +271,7 @@ def _get_settings_for_animation(robot):
         warning = 'End Frame must be larger than Start Frame'
         raise mimic_utils.MimicError(warning)
 
-    '''
-    # Raise warning if no keyframes are set
-    closest_ik_key = mimic_utils.get_closest_ik_keyframe(robot, start_frame)[0]
-    if not type(closest_ik_key) == float:
-        warning = 'You must set an IK or FK keyframe to ensure ' \
-                  'proper evaluation when saving a program; ' \
-                  'no program written'
-        raise mimic_utils.MimicError(warning)
-    '''
-    # All good, create output dictionary
+    # Create output dictionary
     animation_settings = {'Start Frame': start_frame,
                           'End Frame': end_frame,
                           'Framerate': framerate,
@@ -281,10 +285,9 @@ def _get_settings_for_postproc(robot):
     :return program_settings: dictionary
     """
     # Get all important settings
-    using_time_interval = pm.radioCollection(
-        'sample_rate_radio_collection', query=True, select=True) == 'rb_timeInterval'
+    using_time_interval = pm.radioCollection('sample_rate_radio_collection', query=True, select=True) == 'rb_timeInterval'
     using_keyframes_only = not using_time_interval  # TODO: Clever, but not expandable
-    time_interval_value = pm.textField('t_timeBetweenSamples', query=True, text=True)
+    time_interval_value = pm.floatField('f_timeBetweenSamples', query=True, value=True)
     time_interval_units = 'seconds' \
         if pm.radioButtonGrp('time_unit_radio_group', query=True, sl=True) == 1 \
         else 'frames'
@@ -294,21 +297,12 @@ def _get_settings_for_postproc(robot):
     output_filename = pm.textField('t_outputFileName', text=True, query=True)
     template_filename = pm.textField('t_templateFileName', text=True, query=True)
     overwrite_option = pm.checkBox('cb_overwriteFile', value=True, query=True)
-
-    # Get time interval in seconds
-    animation_settings = _get_settings_for_animation(robot)
-    framerate = animation_settings['Framerate']
-    if time_interval_units == 'seconds':
-        sample_rate_sec = float(time_interval_value)
-    else:  # time_interval_units == 'frames'
-        sample_rate_sec = float(time_interval_value) / float(framerate)
-    time_interval_in_seconds = sample_rate_sec
+    preview_in_viewport_option = pm.checkBox('cb_previewInViewport', value=True, query=True)
 
     # Check for warnings
     if using_time_interval:
         # Confirm that the time interval is valid
         try:
-            time_interval_value = float(time_interval_value)
             assert time_interval_value > 0
         except ValueError:
             if time_interval_units == 'seconds':
@@ -341,13 +335,13 @@ def _get_settings_for_postproc(robot):
         'Using Keyframes Only': using_keyframes_only,
         'Time Interval Value': time_interval_value,
         'Time Interval Units': time_interval_units,
-        'Time Interval in Seconds': time_interval_in_seconds,
         'Ignore Warnings': ignore_warnings,
         'Processor Type': processor_type,
         'Output Directory': output_directory,
         'Output Filename': output_filename,
         'Template Filename': template_filename,
-        'Overwrite Option': overwrite_option
+        'Overwrite Option': overwrite_option,
+        'Preview in Viewport': preview_in_viewport_option
     }
     return postproc_settings
 
@@ -365,7 +359,6 @@ def _get_command_dicts(robot, animation_settings, postproc_settings, user_option
     # Determine sample mode
     using_sample_rate = postproc_settings['Using Time Interval']
     using_keyframes_only = postproc_settings['Using Keyframes Only']
-    time_interval_in_seconds = postproc_settings['Time Interval in Seconds']
 
     # Get frames to sample
     frames = []
@@ -377,12 +370,17 @@ def _get_command_dicts(robot, animation_settings, postproc_settings, user_option
         pass
 
     # Get commands from sampled frames
-    command_dicts = _sample_frames_get_command_dicts(robot, frames, animation_settings, time_interval_in_seconds,
-                                                     user_options)
+    command_dicts = _sample_frames_get_command_dicts(robot, frames, animation_settings,
+                                                     user_options, postproc_settings)
     
     if using_sample_rate:
         # Check commands for axis flips and reconcile them if necessary
-        command_dicts = _check_command_rotations(robot, animation_settings, command_dicts)
+        # Only reconcile if we're using axes. Exclude poses
+        if postproc.AXES in command_dicts[0]:
+
+            command_dicts = _reconcile_command_rotations(robot, command_dicts)
+            command_dicts = _bound_accumulated_rotations(robot, command_dicts)
+
 
     return command_dicts
 
@@ -404,6 +402,14 @@ def _check_command_dicts(command_dicts, robot, animation_settings, postproc_sett
     # Check if limits have been exceeded (i.e. velocity, acceleration)
     if user_options.Include_axes and not user_options.Ignore_motion:
         # TODO: Add UI options to select which violations, max/min/avg user wants to check
+
+        # Check position limits
+        position_limits = mimic_utils.get_axis_limits(robot)
+        if position_limits['Axis 1']['Min Limit'] is None:
+            position_warning = 'Unable to check position limits. Robot rig does not contain position data.\n'
+            pm.scrollField(OUTPUT_WINDOW_NAME, insertText=position_warning, edit=True)
+        position_violations, position_stats = _check_command_dicts_limits(command_dicts, limits=position_limits, get_min=True, get_max=True, get_average=True)
+
 
         # Check velocity limits
         velocity_limits = mimic_utils.get_velocity_limits(robot)
@@ -430,6 +436,7 @@ def _check_command_dicts(command_dicts, robot, animation_settings, postproc_sett
         jerk_violations, jerk_stats = _check_command_dicts_limits(jerk_dicts, limits=jerk_limits, get_min=True, get_max=True, get_average=True)
 
         # Format and print axis statistics
+        _print_axis_stats(position_stats, "Position")
         _print_axis_stats(velocity_stats, "Velocity")
         _print_axis_stats(acceleration_stats, "Acceleration")
         _print_axis_stats(jerk_stats, "Jerk")
@@ -461,11 +468,13 @@ def _check_command_dicts(command_dicts, robot, animation_settings, postproc_sett
     # Format and print warnings
     violation_exception = False
     violation_warning = False
-    if velocity_violations or acceleration_violations or jerk_violations:
+    if position_violations or velocity_violations or acceleration_violations or jerk_violations:
         # Print this one always
         pm.headsUpMessage('WARNINGS: See Mimic output window for details')
+        if position_violations:
+            _print_violations(position_violations, position_limits, "Position")
         if velocity_violations:
-            _print_violations(velocity_violations, velocity_limits, "Velocity")
+            _print_violations(velocity_violations, velocity_limits, "Velocity")    
         if acceleration_violations:
             _print_violations(acceleration_violations, acceleration_limits, "Acceleration")
         if jerk_violations:
@@ -495,7 +504,7 @@ def _print_violations(violation_dicts, limits, limit_type):
     padding = {'val_padding' : 13, 'limit_padding' : 10, 'time_padding' : 10, 'frame_padding' : 10}
     
     for axis_name in sorted(violation_dicts):
-        warning += axis_name + " {} Warnings:\n".format(limit_type)
+        warning += axis_name + " {} Violations:\n".format(limit_type)
         axis_num = int(axis_name.split(' ')[-1]) - 1  # This is super hacky... should fix.
         warning += warning_template.format('Time', 'Frame', 'Limit', 'Actual', **padding)
         for violation in violation_dicts[axis_name]:
@@ -505,7 +514,7 @@ def _print_violations(violation_dicts, limits, limit_type):
                 return 
 
             warning += warning_template.format(
-                general_utils.num_to_str(violation['Time Index'], precision=3),
+                general_utils.num_to_str(violation[postproc.TIME_INDEX], precision=3),
                 general_utils.num_to_str(violation['Frame'], precision=3),
                 axis_limit,
                 general_utils.num_to_str(violation[postproc.AXES][axis_num], precision=3),
@@ -542,7 +551,7 @@ def _print_axis_stats(axis_stats, limit_type):
         res[0] += min_max_template.format('Time', 'Frame', 'Min', **min_max_padding)
         for axis_index, command in enumerate(axis_stats['min']):
             res[axis_index+1] += min_max_template.format(
-                general_utils.num_to_str(command['Time Index'], precision=3),
+                general_utils.num_to_str(command[postproc.TIME_INDEX], precision=3),
                 general_utils.num_to_str(command['Frame'], precision=3),
                 general_utils.num_to_str(command[postproc.AXES][axis_index], precision=3),
                 **min_max_padding)
@@ -552,7 +561,7 @@ def _print_axis_stats(axis_stats, limit_type):
         res[0] += min_max_template.format('Time', 'Frame', 'Max', **min_max_padding)
         for axis_index, command in enumerate(axis_stats['max']):
             res[axis_index+1] += min_max_template.format(
-                general_utils.num_to_str(command['Time Index'], precision=3),
+                general_utils.num_to_str(command[postproc.TIME_INDEX], precision=3),
                 general_utils.num_to_str(command['Frame'], precision=3),
                 general_utils.num_to_str(command[postproc.AXES][axis_index], precision=3),
                 **min_max_padding)
@@ -642,6 +651,11 @@ def _check_robot_postproc_compatibility(robot, processor):
     robot_type = mimic_utils.get_robot_type(robot)
     processor_type = processor.type_robot
 
+    
+    # Always return without a warning if the processor is of type "GENERAL"
+    if processor_type == 'GENERAL':
+        return warning
+    
     if robot_type != processor_type:
         warning = 'WARNING!\n' \
                   'The type of robot ({}) \n' \
@@ -651,10 +665,61 @@ def _check_robot_postproc_compatibility(robot, processor):
     return warning
 
 
-def _check_command_rotations(robot, animation_settings, command_dicts):
+def _reconcile_command_rotations(robot_name, command_dicts):
     """
     Check commands that used a sample rate.
-    :param robot:
+
+    This is primarily used to ensure that rotation is accumulated when an axis
+    rotates beyond +/- 180 degrees to avoid discontinuities 
+
+    :param robot_name:
+    :param animation_settings:
+    :param command_dicts:
+    :return:
+    """
+    # Get axes, if they exist
+    command_axes = []
+    for command_dict in command_dicts:
+        axes = command_dict[postproc.AXES] if postproc.AXES in command_dict else None
+        command_axes.append(list(axes))
+
+    reconcile_axes = mimic_utils.get_reconcile_axes(robot_name)
+
+    # Make sure the user has selected use of axes
+    if not all(x is None for x in command_axes):
+        # Get indices for command and axis
+        for command_index in range(len(command_dicts)):
+            for axis_index in range(6):
+                # Get the initial value
+                value = command_axes[command_index][axis_index]
+                reconcile_axis = reconcile_axes[axis_index]
+                # Operate on the value depending on conditional
+                if reconcile_axis:
+                    if command_index == 0: 
+                        continue
+                    else:  # Perform the check
+                        previous_value = command_axes[command_index - 1][axis_index]
+                        value = mimic_utils.accumulate_rotation(
+                                                value,
+                                                previous_value)
+                    # Replace original value with new value
+                    command_axes[command_index][axis_index] = value
+                else:  # Not a problem axis
+                    pass
+            # Replace the original commands with the new commands
+            reconciled_axes = postproc.Axes(*command_axes[command_index])
+            command_dicts[command_index][postproc.AXES] = reconciled_axes
+
+    return command_dicts
+
+
+def _bound_accumulated_rotations(robot_name, command_dicts):
+    """
+    Checks axes whose rotations have been accumulated to ensure they've not 
+    exceeded the stated limits. If they have, this function attempts to slide
+    the commands by +/- 360 degrees. If the limits are still exceeded, this 
+    function returns the commands that exceed the limits by the least amount
+    :param robot_name:
     :param animation_settings:
     :param command_dicts:
     :return:
@@ -666,36 +731,166 @@ def _check_command_rotations(robot, animation_settings, command_dicts):
         axes = command_dict[postproc.AXES] if postproc.AXES in command_dict else None
         command_axes.append(list(axes))
 
+    reconcile_axes = mimic_utils.get_reconcile_axes(robot_name)
+    rotation_limits = mimic_utils.get_all_limits(robot_name)['Position']
+
     # Make sure the user has selected use of axes
     if not all(x is None for x in command_axes):
-        start_frame = animation_settings['Start Frame']
+        for i, reconcile_axis in enumerate(reconcile_axes):
+            if reconcile_axis:
+                valid_solutions = []
+
+                axis_number = i + 1  # Axis numbers are 1-indexed
+                axis_name = 'Axis {}'.format(axis_number)
+
+                # Get the axis limits
+                limit_min = rotation_limits[axis_name]['Min Limit']
+                limit_max = rotation_limits[axis_name]['Max Limit']
+
+                # Create a list of commands for the axis to be checked
+                axis_vals_init = [axis[i] for axis in command_axes]
+
+                axis_min = min(axis_vals_init)
+                axis_max = max(axis_vals_init)
+
+                '''
+                print "#######################################################"
+                print "Initial Axis {} vals: ".format(i+1), axis_vals_init
+                print "Axis Min Limit: ", limit_min
+                print "Axis Max Limit: ", limit_max                
+                print "Axis Min: ", axis_min
+                print "Axis Max: ", axis_max
+                '''
+
+                # If both the max and min axis values exceed their respective
+                # limits, then there's nothing we can do about it, so we don't
+                # modify the commands
+                if axis_min < limit_min and axis_max > limit_max:
+                    # print '## Both limits exceeded, but no shift'
+                    continue
+
+                # If no limits are violated, add the axes to the list of valid solutions
+                if axis_min >= limit_min and axis_max <= limit_max:
+                    valid_solutions.append(axis_vals_init)              
+
+                # Get the shifted axes and append them to the valid_solutions if they're valide (i.e. not 'None')
+                axis_vals_shift = _shift_accumulated_axes(axis_vals_init, limit_max, limit_min)
+
+                if axis_vals_shift:
+                    valid_solutions.append(axis_vals_shift)
+
+                # If we have no valid solitions, continue with the initial solition
+                if len(valid_solutions) == 0:
+                    # print 'No valid solutions, returning initial solutions'
+                    sol = axis_vals_init
+                # If we only have one valid solution, we can return that solution
+                elif len(valid_solutions) == 1:
+                    # print 'Only one valid solution'
+                    sol = valid_solutions[0]
+                # If we have two valid solutions, prompt the user to pick which one they want
+                # if they have the option checked on the program UI, otherwise, return the 
+                # first solution
+                else:
+                    # print 'Two valid solutions -> user choice'
+                    prompt_opt = pm.checkBox('cb_promptOnRedundantSolutions', value=True, query=True)
+
+                    # If the user option for this feature is selected, prompt the user
+                    if prompt_opt:
+                        user_selection = _get_bounded_solution_user_input(valid_solutions, axis_number)
+                        sol = valid_solutions[user_selection]
+                    # Otherwise, continue with the initial solution
+                    else:
+                        sol = axis_vals_init
+                # Drop the final solution back into the command_dict
+                for command_index in range(len(command_dicts)):
+                    command_axes[command_index][i] = sol[command_index]       
+
+                    reconciled_axes = postproc.Axes(*command_axes[command_index])
+                    command_dicts[command_index][postproc.AXES] = reconciled_axes
+                
+    return command_dicts
+
+def _shift_accumulated_axes(initial_vals, limit_max, limit_min):
+    axis_min = min(initial_vals)
+    axis_max = max(initial_vals)
+
+    axis_vals_shift = []
+
+    ## Try bounding the values between the limits by shifting
+    ## the commands by +/- 360 degrees
+
+    coeff = -1 if (limit_max - axis_max) > -(limit_min - axis_min) else 1
+
+    # Check if the adjusted values would still violate the limits
+    # and if so, return an empty list
+    axis_min_shift = axis_min - (coeff * 360)
+    axis_max_shift = axis_max - (coeff * 360)
+
+    # print "Axis Min Shifted: ", axis_min_shift
+    # print "Axis Max Shifted: ", axis_max_shift
+
+    if axis_min_shift < limit_min or axis_max_shift > limit_max:
+        return
+
+    # If we've made it this far, it means the shifted values won't violate the 
+    # limits, so get the shifted values    
+    axis_vals_shift = [val - (coeff * 360) for val in initial_vals]
+    
+    return axis_vals_shift
+
+
+def _get_bounded_solution_user_input(valid_solutions, axis_number):
+    # print valid_solutions
+    sol_0_init = valid_solutions[0][0]
+    sol_1_init = valid_solutions[1][0]
+
+    sol_0_str = str(int(round(sol_0_init)))
+    sol_1_str = str(int(round(sol_1_init)))
+
+
+    result = pm.confirmDialog(
+        title='Select Axis Solution',
+        message='Axis {0} has multiple valid solutions.\n\nWould you like Axis {0} to start at:'.format(axis_number),
+        button=[sol_0_str, sol_1_str],
+        defaultButton=sol_0_str,
+        cancelButton=sol_0_str,
+        dismissString=sol_0_str)
+
+    if result == sol_0_str:
+        return 0
+    elif result == sol_1_str:
+        return 1
+    else:
+        return 0
+
+
+def _couple_axes(command_dicts):
+    """
+    If axis 2 and 3 are coupled (as they are with FANUC, for example),
+    Modify A3 accordingly
+    """
+    # Get axes, if they exist
+    command_axes = []
+    for command_dict in command_dicts:
+        axes = command_dict[postproc.AXES] if postproc.AXES in command_dict else None
+        command_axes.append(list(axes))
+
+    # Make sure the user has selected use of axes
+    if not all(x is None for x in command_axes):
         # Get indices for command and axis
         for command_index in range(len(command_dicts)):
-            for axis_index in range(6):
-                # Get the initial value
-                value = command_axes[command_index][axis_index]
-                # Operate on the value depending on conditional
-                if axis_index == 3 or axis_index == 5:  # zero-indexed
-                    rotation_axis = 'Z'
-                    if command_index == 0:  # Get initial value
-                        axis_number = axis_index + 1
-                        value = mimic_utils.get_reconciled_rotation_value(
-                            robot,
-                            axis_number,
-                            rotation_axis,
-                            start_frame)[0]
-                    else:  # Perform the check
-                        previous_value = command_axes[command_index - 1][axis_index]
-                        value = mimic_utils.accumulate_rotation(
-                            value,
-                            previous_value)
-                    # Replace original value with new value
-                    command_axes[command_index][axis_index] = value
-                else:  # Not a problem axis
-                    pass
+            theta_2 = command_axes[command_index][1]
+            theta_3 = command_axes[command_index][2]
+
+            theta_3_coupled = theta_3 - theta_2
+
+            # Replace theta_3 in the command_axes list with the coupled value
+            command_axes[command_index][2] = theta_3_coupled
+
             # Replace the original commands with the new commands
-            reconciled_axes = postproc.Axes(*command_axes[command_index])
-            command_dicts[command_index][postproc.AXES] = reconciled_axes
+            coupled_commands = postproc.Axes(*command_axes[command_index])
+            command_dicts[command_index][postproc.AXES] = coupled_commands
+
     return command_dicts
 
 
@@ -730,10 +925,7 @@ def _get_frames_using_sample_rate(animation_settings, postproc_settings):
         frames = [start_frame + round(i * step_frame, 3) for i in range(0, num_steps)]
 
     return frames
- 
 
-    return frames
- 
 
 def _get_frames_using_keyframes_only(robot, animation_settings):
     """
@@ -754,7 +946,7 @@ def _get_frames_using_keyframes_only(robot, animation_settings):
         time='{}:{}'.format(start_frame, end_frame))
     # Verify that there is also a keyframe set on the FK controls' rotate
     # attributes. If there's not, we remove it from the list
-    # Note: we only need to check on controller as they are all keyframed
+    # Note: we only need to check one controller as they are all keyframed
     # together
     fk_test_handle_path = mimic_utils.format_path('{0}|{1}robot_GRP|{1}FK_CTRLS|{1}a1FK_CTRL.rotateY', robot)
     frames = [frame for frame in ik_keyframes if pm.keyframe(
@@ -764,7 +956,7 @@ def _get_frames_using_keyframes_only(robot, animation_settings):
     return frames
 
 
-def _sample_frames_get_command_dicts(robot_name, frames, animation_settings, time_interval_in_seconds, user_options):
+def _sample_frames_get_command_dicts(robot_name, frames, animation_settings, user_options, postproc_settings):
     """
     Sample robot commands using a list of frames and user options.
     :param robot_name:
@@ -775,21 +967,24 @@ def _sample_frames_get_command_dicts(robot_name, frames, animation_settings, tim
     """
     # Initialize output array.
     command_dicts = []
-    time_index_count = 0
     start_frame = animation_settings['Start Frame']
     end_frame = animation_settings['End Frame']
 
+    preview_in_viewport = postproc_settings['Preview in Viewport']
+    export_progress = 0
+
     for frame in frames:
-        # Set the background to the current frame
-        # TODO: Implement this! This rocks:
-        # pm.currentTime(frame)
+
+        if preview_in_viewport:
+            # Set the background to the current frame
+            pm.currentTime(frame)
+
         # Create a dict of datatypes per frame
         command_dict = {}
         # Add this frame number/step/index to the dictionary
         command_dict['Frame'] = frame
         command_dict['Framerate'] = animation_settings['Framerate']
-        command_dict['Time Index'] = time_index_count * time_interval_in_seconds
-        time_index_count += 1
+        command_dict[postproc.TIME_INDEX] = (frame-start_frame) / animation_settings['Framerate']
 
         # Get motion parameters
         if not user_options.Ignore_motion:
@@ -825,10 +1020,9 @@ def _sample_frames_get_command_dicts(robot_name, frames, animation_settings, tim
                 pass
         command_dicts.append(command_dict)
         pm.refresh()
-        _update_export_progress_bar(start_frame, end_frame, frame)
+        export_progress = _update_export_progress_window(start_frame, end_frame, frame, export_progress)
     # Reset current frame (just in case)
     pm.currentTime(frames[0])
-    mimic_utils.reconcile_rotation(force_eval=True)
 
     return command_dicts
 
@@ -842,13 +1036,12 @@ def _sample_frame_get_axes(robot_name, frame):
     """
 
     axes = []
-    pm.currentTime(frame)
 
     target_ctrl_path = mimic_utils.get_target_ctrl_path(robot_name)
     for i in range(6):
         axis_number = i + 1  # Axis numbers are 1-indexed
         axis_path = target_ctrl_path + '.axis{}'.format(axis_number)
-        axis = pm.getAttr(axis_path)
+        axis = pm.getAttr(axis_path, time=frame)
 
         axes.append(axis)
         
@@ -864,6 +1057,7 @@ def _sample_frame_get_pose(robot_name, frame):
     """
     # Set the time
     # TODO: Implement this in parent function
+    # Need to figure out how to query xform at specific frame (like with getAttr)
     pm.currentTime(frame)
 
     # tool_name = get_tool_name(robot_name)
@@ -1000,9 +1194,11 @@ def _sample_frame_get_outs(robot_name, frame, out_type='digital'):
 
     # Get all external axes for this robot
     io_names = mimic_io.get_io_names(robot_name)
+
     # Get info dict for each of those IOs
     for io_name in io_names:
         info = mimic_io.get_io_info_simple(robot_name, io_name, frame)
+
         # Get values from info dict
         ignore = info[key_ignore]
         if not ignore:
@@ -1040,22 +1236,58 @@ def _sample_frame_get_configuration(robot_name, frame):
     return configuration
 
 
-def _initialize_export_progress_bar(is_on=True):
+def _initialize_export_progress_window(title):
     """
+    Create progress window with a range from 0 - 100%.
+
+    :param title: Title of progress window
     """
-    pm.progressBar('pb_exportProgress', edit=True, progress=0)
-    pm.progressBar('pb_exportProgress', edit=True, visible=is_on)
+    _destroy_progress_window()
+
+    #  Create our progress window
+    pm.progressWindow(title=title,
+                      status='Progress:',
+                      progress=0,
+                      maxValue=100,
+                      isInterruptable=True)
 
 
-def _update_export_progress_bar(start_frame, end_frame, frame_index):
+def _destroy_progress_window():
+    """ Destroy any extant progress windows. Only one progress window can exist
+    at a time.
     """
+    pm.progressWindow(endProgress=True)
+
+
+def _update_export_progress_window(start_frame, end_frame, frame_index, prev_progress):
     """
+    Update progress displayed in the progress window. Check if user has pressed
+    'Esc' and raise MimicError to cancel export.
+
+    :param start_frame: export starting frame
+    :param end_frame: export ending frame
+    :param frame_index: most recently processed frame (between start and end)
+    :param prev_progress: previous export progress (integer from 0 - 100)
+    :return: current export progress (integer from 0 - 100)
+    """
+
+    # Check if the user pressed 'Esc'
+    if pm.progressWindow(query=True, isCancelled=True):
+        _destroy_progress_window()
+        raise mimic_utils.MimicError('Path export canceled by user.')
+
+    export_progress = 0
+
     frame_range = end_frame - start_frame
-
-    if (frame_range == 0):
-        step = 0
-    else:
+    if frame_range:
         export_bar_range = 100
         step = ((frame_index - start_frame) * export_bar_range) / frame_range
-        pm.progressBar('pb_exportProgress', edit=True, progress=int(step))
+        export_progress = int(step)
 
+        # Updating the Maya UI is slow, so we only make updates if we need to.
+        if export_progress != prev_progress:
+            pm.progressWindow(edit=True,
+                              progress=export_progress,
+                              status='Progress:')
+
+    return export_progress

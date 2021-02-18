@@ -32,9 +32,8 @@ def load_mimic_plugins():
     """
     # Plugin is dependent on the following scripts
     required_plugins = [
-        'robotAccumRot',
         'robotIK',
-        'robotLimitRot',
+        'robotLimitBlender',
         'snapTransforms'
     ]
     # Check to see if each plug-in is loaded
@@ -120,5 +119,9 @@ def run():
     # Perform preliminary checks
     confirm_requirements_exist()
     load_mimic_plugins()
+    # Update file preferences with user current preferences
+    mimic_config.Prefs.save_prefs_in_maya_file()
     # Build the UI itself
     mimic_ui.build_mimic_ui()
+    # Register callbacks that reload mimic when a file is opened/created
+    mimic_config.register_config_callbacks()
